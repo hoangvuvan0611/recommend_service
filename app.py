@@ -1,206 +1,385 @@
+import traceback
+
 import pandas as pd
 import pickle
 import os
-import json
 import time
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from flask_cors import CORS
-import threading
-import logging
-
-# Cấu hình logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger('RecommendationService')
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Cho phép truy cập từ các origin khác nhau
 
-# Đường dẫn lưu trữ dữ liệu và mô hình
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-MODEL_DIR = os.path.join(BASE_DIR, 'models')
+# Biến lưu trạng thái API
+api_status = {
+    "status": "initializing",  # Các trạng thái: initializing, loading, ready, error
+    "model_loaded": False,
+    "last_updated": None,
+    "error_message": None,
+    "data_info": None
+}
 
-# Tạo thư mục nếu chưa tồn tại
-os.makedirs(DATA_DIR, exist_ok=True)
+# Thiết lập đường dẫn cố định đến thư mục dữ liệu
+DATA_DIR = r"D:\data_train"  # Đường dẫn đến thư mục chứa file CSV
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+
+# Đảm bảo thư mục mô hình tồn tại
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Đường dẫn file dữ liệu
-PRODUCT_CSV = os.path.join(DATA_DIR, 'product.csv')
+# Đường dẫn đến các file dữ liệu
+df_product_path = os.path.join(DATA_DIR, 'Product.csv')
+df_description_path = os.path.join(DATA_DIR, 'Description.csv')
+df_category_path = os.path.join(DATA_DIR, 'Category.csv')
 
-# Đường dẫn file mô hình
-MODEL_FILE = os.path.join(MODEL_DIR, 'recommendation_model.pkl')
-LAST_UPDATED_FILE = os.path.join(MODEL_DIR, 'last_updated.txt')  # Lưu trữ thời gian cập nhật cuối cùng, phục vụ kiểm tra trạng thái
-
-# Biến toàn cục lưu trữ mô hình đã được load
-model_data = None
-training_lock = threading.Lock()
-model_load_time = None
+# Đường dẫn đến các file mô hình
+tfidf_matrix_path = os.path.join(MODEL_DIR, 'tfidf_matrix.pkl')
+cosine_sim_path = os.path.join(MODEL_DIR, 'cosine_sim.pkl')
+model_data_path = os.path.join(MODEL_DIR, 'model_data.pkl')
 
 
-def load_model():
-    """Load mô hình từ file nếu đã tồn tại"""
-    global model_data, model_load_time
+def update_status(status, model_loaded=None, error_message=None, data_info=None):
+    """Cập nhật trạng thái API"""
+    global api_status
+    api_status["status"] = status
+    api_status["last_updated"] = time.time()
 
-    if os.path.exists(MODEL_FILE):
+    if model_loaded is not None:
+        api_status["model_loaded"] = model_loaded
+
+    if error_message is not None:
+        api_status["error_message"] = error_message
+
+    if data_info is not None:
+        api_status["data_info"] = data_info
+
+    print(f"API Status: {status}, Model loaded: {api_status['model_loaded']}")
+
+
+def check_data_files():
+    """Kiểm tra các file dữ liệu có tồn tại không"""
+    files_exist = {
+        "product": os.path.exists(df_product_path),
+        "description": os.path.exists(df_description_path),
+        "category": os.path.exists(df_category_path)
+    }
+
+    return files_exist, all(files_exist.values())
+
+
+def load_data():
+    """Load và xử lý dữ liệu, lưu kết quả vào biến toàn cục"""
+    global cleaned_df, indices, cosine_sim
+
+    update_status("LD0001: loading")
+
+    # Kiểm tra các file dữ liệu
+    files_status, all_files_exist = check_data_files()
+    if not all_files_exist:
+        error_message = f"Missing data files: {files_status}"
+        print("LD0002: " + error_message)
+        update_status("error", model_loaded=False, error_message=error_message)
+        return False
+
+    try:
+        # Kiểm tra xem có thể load mô hình đã lưu trước đó không
+        if os.path.exists(model_data_path):
+            print("Loading pre-trained model data...")
+            with open(model_data_path, 'rb') as f:
+                data = pickle.load(f)
+                cleaned_df = data['cleaned_df']
+                indices = data['indices']
+                cosine_sim = data['cosine_sim']
+
+            print("LD0003: check model data")
+            update_status("ready", model_loaded=True,
+                          data_info={"products": len(cleaned_df),
+                                     "last_model_update": time.ctime(os.path.getmtime(model_data_path))})
+            return True
+    except Exception as e:
+        print(f"Error loading pre-trained data: {e}")
+        error_message = f"Error loading model data: {str(e)}"
+        update_status("error", model_loaded=False, error_message=error_message)
+
+    # Nếu không thể load, thực hiện xử lý dữ liệu từ đầu
+    try:
+        print("Processing data from CSV files at", DATA_DIR)
+        # Load dữ liệu từ CSV
         try:
-            with open(MODEL_FILE, 'rb') as f:
-                model_data = pickle.load(f)
-                logger.info(f"Model loaded from {MODEL_FILE}")
-                if os.path.exists(LAST_UPDATED_FILE):
-                    with open(LAST_UPDATED_FILE, 'r') as f:
-                        model_load_time = float(f.read().strip())
-                return True
-        except Exception as e:
-            logger.error(f"Error loading model: {e}")
-    return False
+            df_product = pd.read_csv(df_product_path)
+            df_description = pd.read_csv(df_description_path)
+            df_category = pd.read_csv(df_category_path)
+            print("LD000-1: Data loaded successfully from", DATA_DIR)
+        except Exception as file_error:
+            error_message = f"Error loading data from {DATA_DIR}: {str(file_error)}"
+            print("LD000-2:" + error_message)
+            update_status("error", model_loaded=False, error_message=error_message)
+            return False
 
+        # In thông tin debug
+        print("df_product columns:", df_product.columns.tolist())
+        print("df_description columns:", df_description.columns.tolist())
+        print("df_category columns:", df_category.columns.tolist())
 
-def train_model(force=False):
-    """Train mô hình từ file CSV và lưu lại"""
-    global model_data, model_load_time
+        # Merge thông tin bảng product và description
+        try:
+            merged_df = pd.merge(df_product, df_description, on='id', how='inner')
+            print(f"Merged product & description: {merged_df.shape[0]} rows")
 
-    # Kiểm tra xem có cần train lại hay không
-    if not force and model_data is not None:
-        return True
+            # Làm sạch thông tin category
+            category_cleaned_df = df_category.copy()
+            if 'image' in category_cleaned_df.columns:
+                category_cleaned_df = category_cleaned_df.drop(columns=['image', 'status', 'created_at'],
+                                                               errors='ignore')
+            category_cleaned_df.rename(columns={'id': 'category'}, inplace=True)
 
-    # Chỉ cho phép một thread thực hiện training tại một thời điểm, tránh gây race condition
-    if not training_lock.acquire(blocking=False):
-        logger.info("Another training process is already running")
+            # Merge với category
+            merged_df2 = pd.merge(category_cleaned_df, merged_df, on='category', how='inner')
+            print(f"Merged with category: {merged_df2.shape[0]} rows")
+
+            # Lấy các cột cần thiết và đổi tên
+            columns_to_drop = ['slug_x', 'id', 'slug_y', 'category', 'unit', 'original_price',
+                               'sale_price', 'expiry_period', 'status', 'created_at',
+                               'modified_at', 'image']
+
+            # Chỉ drop những cột tồn tại
+            existing_columns = [col for col in columns_to_drop if col in merged_df2.columns]
+            cleaned_df = merged_df2.drop(columns=existing_columns, errors='ignore')
+
+            # Đổi tên cột nếu chúng tồn tại
+            cleaned_df.rename(columns={'name_x': 'category', 'name_y': 'name'}, inplace=True)
+
+            # Đảm bảo dữ liệu không có giá trị null
+            cleaned_df['uses'] = cleaned_df['uses'].fillna('')
+            print(f"Cleaned dataframe: {cleaned_df.shape[0]} rows, {cleaned_df.shape[1]} columns")
+            print("Columns after cleaning:", cleaned_df.columns.tolist())
+
+            # Tạo các stop words tiếng Việt để lọc
+            my_stop_words = ["là", "của", "và", "nhưng", "hay", "hoặc", "tôi", "bạn", "mình",
+                             "họ", "nó", "rất", "quá", "lắm", "không", "có", "làm", "được",
+                             "tốt", "xấu"]
+
+            # Tạo TF-IDF Vectorizer với tham số phù hợp cho tiếng Việt
+            tfv = TfidfVectorizer(min_df=3, max_features=None, strip_accents='unicode',
+                                  analyzer='word', token_pattern=r'\w{1,}',
+                                  ngram_range=(1, 3), stop_words=my_stop_words)
+
+            # Tính toán ma trận TF-IDF dựa trên cột 'uses'
+            print("Calculating TF-IDF matrix...")
+            tfv_matrix = tfv.fit_transform(cleaned_df['uses'])
+            print(f"TF-IDF matrix shape: {tfv_matrix.shape}")
+
+            # Tính toán Sigmoid kernel thay vì Cosine similarity
+            print("Calculating similarity matrix...")
+            from sklearn.metrics.pairwise import sigmoid_kernel
+            cosine_sim = sigmoid_kernel(tfv_matrix, tfv_matrix)
+            print(f"Similarity matrix shape: {cosine_sim.shape}")
+
+            # Tạo mapping từ tên sản phẩm đến chỉ mục
+            cleaned_df = cleaned_df.reset_index(drop=True)  # Reset index để đảm bảo chỉ mục đúng
+            indices = pd.Series(cleaned_df.index, index=cleaned_df['name']).drop_duplicates()
+            print(f"Created indices mapping for {len(indices)} products")
+
+            # Lưu mô hình để sử dụng lại
+            data = {
+                'cleaned_df': cleaned_df,
+                'indices': indices,
+                'cosine_sim': cosine_sim
+            }
+
+            print("Saving model data...")
+            with open(model_data_path, 'wb') as f:
+                pickle.dump(data, f)
+
+            print("LD0004: Complete training model")
+            update_status("ready", model_loaded=True,
+                          data_info={"products": len(cleaned_df), "last_model_update": time.ctime()})
+            return True
+
+        except Exception as merge_error:
+            traceback_info = traceback.format_exc()
+            error_message = f"Error in data processing: {str(merge_error)}\n{traceback_info}"
+            print("LD000-3: " + error_message)
+            update_status("error", model_loaded=False, error_message=error_message)
+            return False
+
+    except Exception as e:
+        traceback_info = traceback.format_exc()
+        error_message = f"Error processing data: {str(e)}\n{traceback_info}"
+        print("LD000-3: " + error_message)
+        update_status("error", model_loaded=False, error_message=error_message)
         return False
 
+
+# Hàm gợi ý sản phẩm
+def give_rec(name, count=10):
+    global indices, cleaned_df  # sig là biến toàn cục chứa ma trận tương đồng
+
     try:
-        logger.info("Starting model training...")
+        # Lấy chỉ số của sản phẩm từ tên
+        idx = indices[name]
+        # Tính toán các điểm tương đồng giữa sản phẩm và các sản phẩm khác
+        sig_scores = list(enumerate(cosine_sim[idx]))
+        # Sắp xếp theo điểm tương đồng giảm dần
+        sig_scores = sorted(sig_scores, key=lambda x: x[1], reverse=True)
+        # Bỏ qua sản phẩm đầu tiên (chính nó) và lấy count sản phẩm tiếp theo
+        sig_scores = sig_scores[1:count+1]
+        # Lấy chỉ số các sản phẩm được gợi ý
+        uses_indices = [i[0] for i in sig_scores]
+        # Trả về tên của các sản phẩm gợi ý
+        return cleaned_df['name'].iloc[uses_indices].tolist()
+    except Exception as e:
+        print(f"GR000-1: Error in recommendation: {str(e)}")
+        return ["Error generating recommendations"]
 
-        # Kiểm tra file dữ liệu
-        if not os.path.exists(PRODUCT_CSV):
-            logger.error(f"Product CSV file not found at {PRODUCT_CSV}")
-            return False
 
-        # Đọc dữ liệu từ CSV
-        df_products = pd.read_csv(PRODUCT_CSV)
-
-        # Xử lý dữ liệu thiếu
-        df_products = df_products.fillna('')
-
-        # Tạo cột đặc trưng kết hợp cho content-based filtering
-        # Giả sử rằng CSV có các cột như 'name', 'description', 'category', 'brand', 'tags'
-        # Điều chỉnh theo cấu trúc thực tế của file CSV của bạn
-        feature_cols = ['name', 'description', 'category', 'brand', 'tags']
-        available_cols = [col for col in feature_cols if col in df_products.columns]
-
-        if not available_cols:
-            logger.error("No usable feature columns found in the CSV")
-            return False
-
-        # Tạo cột đặc trưng tổng hợp từ các cột có sẵn
-        df_products['features'] = df_products[available_cols].apply(
-            lambda row: ' '.join(str(row[col]) for col in available_cols), axis=1
-        )
-
-        # Tạo ma trận TF-IDF
-        tfidf = TfidfVectorizer(stop_words='english')
-        tfidf_matrix = tfidf.fit_transform(df_products['features'])
-
-        # Tính toán ma trận tương đồng cosine
-        cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
-
-        # Tạo các index để tra cứu nhanh
-        indices = pd.Series(df_products.index, index=df_products['id'].astype(str))
-        name_indices = pd.Series(df_products.index, index=df_products['name']).drop_duplicates()
-
-        # Lưu mô hình vào file
-        model_data = {
-            'products': df_products,
-            'tfidf': tfidf,
-            'tfidf_matrix': tfidf_matrix,
-            'cosine_sim': cosine_sim,
-            'indices': indices,
-            'name_indices': name_indices
+# API gọi để kiểm tra server
+@app.route('/api/status', methods=['GET'])
+def status():
+    # Thêm thông tin chi tiết về đường dẫn và file
+    file_status, _ = check_data_files()
+    status_detail = {
+        **api_status,
+        "file_paths": {
+            "data_dir": DATA_DIR,
+            "model_dir": MODEL_DIR,
+        },
+        "files": {
+            "data_files": file_status,
+            "model_file_exists": os.path.exists(model_data_path)
         }
-
-        with open(MODEL_FILE, 'wb') as f:
-            pickle.dump(model_data, f)
-
-        # Lưu thời gian cập nhật
-        model_load_time = time.time()
-        with open(LAST_UPDATED_FILE, 'w') as f:
-            f.write(str(model_load_time))
-
-        logger.info(f"Model trained successfully with {len(df_products)} products")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error during model training: {e}")
-        return False
-    finally:
-        training_lock.release()
+    }
+    return jsonify(status_detail)
 
 
-def get_recommendations_by_id(product_id, num_recommendations=5):
-    """Lấy các sản phẩm tương tự dựa trên ID"""
-    if model_data is None:
-        return [], "Model not loaded"
+# API khởi tạo lại dữ liệu (tải lại model)
+@app.route('/api/reload', methods=['GET'])
+def reload_data():
+    success = load_data()
+    return jsonify({
+        "success": success,
+        "status": api_status
+    })
 
-    # Chuyển ID sang string để đảm bảo việc so sánh đúng
-    product_id = str(product_id)
+
+# API gợi ý sản phẩm với tên - CHUẨN API
+@app.route('/api/recommend/<product_name>', methods=['GET'])
+def recommend(product_name):
+    if api_status["status"] != "ready":
+        return jsonify({
+            "status": "error",
+            "message": f"API not ready. Current status: {api_status['status']}",
+            "details": api_status
+        }), 503
 
     try:
-        if product_id not in model_data['indices']:
-            return [], f"Product ID {product_id} not found"
+        num_recommendations = request.args.get('count', default=10, type=int)
+        recommendations = give_rec(product_name, num_recommendations)
 
-        idx = model_data['indices'][product_id]
-        sim_scores = list(enumerate(model_data['cosine_sim'][idx]))
-        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-        sim_scores = sim_scores[1:num_recommendations + 1]
-        product_indices = [i[0] for i in sim_scores]
+        if isinstance(recommendations, dict) and "error" in recommendations:
+            return jsonify({
+                "status": "error",
+                "message": recommendations["error"]
+            }), 500
 
-        # Tạo danh sách kết quả từ DataFrame gốc
-        result_df = model_data['products'].iloc[product_indices].copy()
-        result_df['similarity'] = [score[1] for score in sim_scores]
-
-        # Chuyển kết quả thành list dictionaries
-        results = result_df.to_dict('records')
-        return results, None
-
+        return jsonify({
+            "status": "success",
+            "product_name": product_name,
+            "recommendations": recommendations
+        })
     except Exception as e:
-        logger.error(f"Error getting recommendations by ID: {e}")
-        return [], str(e)
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 
-def get_recommendations_by_name(product_name, num_recommendations=5):
-    """Lấy các sản phẩm tương tự dựa trên tên sản phẩm"""
-    if model_data is None:
-        return [], "Model not loaded"
+# API gọi đơn giản - phiên bản từ đoạn code thứ hai
+@app.route('/recommend/<product_name>', methods=['GET'])
+def simple_recommend(product_name):
+    if api_status["status"] != "ready":
+        return jsonify({
+            "error": "API not ready",
+            "status": api_status["status"]
+        }), 503
+
+    recommendations = give_rec(product_name)
+    return jsonify(recommendations)
+
+
+# API gợi ý sản phẩm với id
+@app.route('/api/recommend-by-id/<int:product_id>', methods=['GET'])
+def recommend_by_id(product_id):
+    if api_status["status"] != "ready":
+        return jsonify({
+            "status": "error",
+            "message": f"API not ready. Current status: {api_status['status']}",
+            "details": api_status
+        }), 503
 
     try:
-        if product_name not in model_data['name_indices']:
-            return [], f"Product name '{product_name}' not found"
+        num_recommendations = request.args.get('count', default=5, type=int)
+        # Tìm tên sản phẩm từ id
+        product_row = cleaned_df[cleaned_df['id'] == product_id]
+        if product_row.empty:
+            return jsonify({
+                "status": "error",
+                "message": f"Product with ID {product_id} not found"
+            }), 404
 
-        idx = model_data['name_indices'][product_name]
-        sim_scores = list(enumerate(model_data['cosine_sim'][idx]))
-        sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-        sim_scores = sim_scores[1:num_recommendations + 1]
-        product_indices = [i[0] for i in sim_scores]
+        product_name = product_row['name_y'].iloc[0]
+        recommendations = give_rec(product_name, num_recommendations)
 
-        # Tạo danh sách kết quả từ DataFrame gốc
-        result_df = model_data['products'].iloc[product_indices].copy()
-        result_df['similarity'] = [score[1] for score in sim_scores]
-
-        # Chuyển kết quả thành list dictionaries
-        results = result_df.to_dict('records')
-        return results, None
-
+        return jsonify({
+            "status": "success",
+            "product_id": product_id,
+            "product_name": product_name,
+            "recommendations": recommendations
+        })
     except Exception as e:
-        logger.error(f"Error getting recommendations by name: {e}")
-        return [], str(e)
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
-@app.route('/')
-def hello_world():  # put application's code here
-    return 'Hello World Tôi là hoàng!'
 
+# API lấy danh sách tất cả sản phẩm
+@app.route('/api/products', methods=['GET'])
+def get_products():
+    if api_status["status"] != "ready":
+        return jsonify({
+            "status": "error",
+            "message": f"API not ready. Current status: {api_status['status']}",
+            "details": api_status
+        }), 503
+
+    try:
+        limit = request.args.get('limit', default=100, type=int)
+        products = cleaned_df[['id', 'name_y', 'name_x']].head(limit).to_dict(orient='records')
+        return jsonify({
+            "status": "success",
+            "count": len(products),
+            "products": products
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+
+# Khởi tạo dữ liệu khi khởi động module
+update_status("initializing")
 
 if __name__ == '__main__':
-    app.run()
+    # Load dữ liệu khi khởi động
+    load_success = load_data()
+
+    if load_success:
+        print("Data loaded successfully. Starting API server...")
+        # Chạy API trên cổng 5000 và cho phép kết nối từ tất cả interfaces
+        app.run(host='0.0.0.0', port=5000, debug=False)
+    else:
+        print("WARNING: Starting API server without data loaded. Status will be 'error' until reload.")
+        app.run(host='0.0.0.0', port=5000, debug=False)
