@@ -214,24 +214,26 @@ def load_data():
 
 # Hàm gợi ý sản phẩm
 def give_rec(name, count=10):
-    global indices, cleaned_df  # sig là biến toàn cục chứa ma trận tương đồng
-
+    global indices, cleaned_df  # cosine_sim cũng là biến toàn cục
     try:
         # Lấy chỉ số của sản phẩm từ tên
         idx = indices[name]
-        # Tính toán các điểm tương đồng giữa sản phẩm và các sản phẩm khác
+        # Tính toán điểm tương đồng
         sig_scores = list(enumerate(cosine_sim[idx]))
         # Sắp xếp theo điểm tương đồng giảm dần
         sig_scores = sorted(sig_scores, key=lambda x: x[1], reverse=True)
         # Bỏ qua sản phẩm đầu tiên (chính nó) và lấy count sản phẩm tiếp theo
         sig_scores = sig_scores[1:count+1]
-        # Lấy chỉ số các sản phẩm được gợi ý
-        uses_indices = [i[0] for i in sig_scores]
-        # Trả về tên của các sản phẩm gợi ý
-        return cleaned_df['name'].iloc[uses_indices].tolist()
+        # Lấy chỉ số của các sản phẩm gợi ý
+        rec_indices = [i[0] for i in sig_scores]
+        # Lấy thông tin id và tên của các sản phẩm được gợi ý
+        recommendations_df = cleaned_df.iloc[rec_indices][['product', 'name']]
+        # Chuyển dataframe sang list các dict
+        recommendations = recommendations_df.to_dict(orient='records')
+        return recommendations
     except Exception as e:
         print(f"GR000-1: Error in recommendation: {str(e)}")
-        return ["Error generating recommendations"]
+        return [{"error": "Error generating recommendations"}]
 
 
 # API gọi để kiểm tra server
@@ -356,7 +358,7 @@ def get_products():
 
     try:
         limit = request.args.get('limit', default=100, type=int)
-        products = cleaned_df[['id', 'name_y', 'name_x']].head(limit).to_dict(orient='records')
+        products = cleaned_df[['product', 'name']].head(limit).to_dict(orient='records')
         return jsonify({
             "status": "success",
             "count": len(products),
