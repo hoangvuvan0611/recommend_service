@@ -335,12 +335,13 @@ def recommend_by_id(product_id):
             return jsonify({"status": "error", "message": f"Product with ID {product_id} not found"}), 404
         product_name = product_row['name'].iloc[0]
         recommendations = give_rec(product_name, num_recommendations)
-        return jsonify({
-            "status": "success",
-            "product_id": product_id,
-            "product_name": product_name,
-            "recommendations": recommendations
-        })
+        # return jsonify({
+        #     "status": "success",
+        #     "product_id": product_id,
+        #     "product_name": product_name,
+        #     "recommendations": recommendations
+        # })
+        return jsonify(give_rec(product_name, num_recommendations))
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
