@@ -7,10 +7,19 @@ import pickle
 import pandas as pd
 import psycopg2
 from psycopg2 import sql
+from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, jsonify, request
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import sigmoid_kernel
 from flask_cors import CORS
+from collaborative_filtering import (
+    build_collaborative_model,
+    item_based_recommendations,
+    user_based_recommendations,
+    hybrid_recommendations,
+    record_user_action,
+    snowflakeIdGenerator
+)
 
 # Cấu hình Flask và CORS
 app = Flask(__name__)
@@ -25,7 +34,8 @@ api_status = {
     "model_loaded": False,
     "last_updated": None,
     "error_message": None,
-    "data_info": None
+    "data_info": None,
+    "collaborative_model_loaded": False,
 }
 
 # Cấu hình thư mục mô hình
@@ -180,6 +190,16 @@ def load_data():
 
         update_status("ready", model_loaded=True,
                       data_info={"products": len(cleaned_df), "last_model_update": time.ctime()})
+
+        try:
+            conn = get_db_connection()
+            collab_success = build_collaborative_model(conn)
+            conn.close()
+            api_status["collaborative_model_loaded"] = collab_success
+        except Exception as e:
+            api_status["collaborative_model_loaded"] = False
+            logging.error("Failed to load collaborative model: %s", str(e))
+
         return True
 
     except Exception as e:
@@ -329,7 +349,7 @@ def recommend_by_id(product_id):
         }), 503
 
     try:
-        num_recommendations = request.args.get('count', default=5, type=int)
+        num_recommendations = request.args.get('count', default=10, type=int)
         product_row = cleaned_df[cleaned_df['id'] == product_id]
         if product_row.empty:
             return jsonify({"status": "error", "message": f"Product with ID {product_id} not found"}), 404
@@ -384,6 +404,65 @@ def test_db_connection():
             "message": f"Database connection failed: {str(e)}"
         }), 500
 
+@app.route('/api/record-action', methods=['POST'])
+def record_action():
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        session_id = data.get('session_id')
+        product_id = data.get('product_id')
+        action_type = data.get('action_type')
+        action_value = data.get('action_value', '1')
+
+        if not session_id and not user_id:
+            return jsonify({"status": "error", "message": "Either user_id or session_id is required"}), 400
+        if not product_id or not action_type:
+            return jsonify({"status": "error", "message": "product_id and action_type are required"}), 400
+
+        conn = get_db_connection()
+        success = record_user_action(conn, user_id, session_id, product_id, action_type, action_value)
+        conn.close()
+
+        return jsonify({
+            "status": "success" if success else "error",
+            "message": "Action recorded" if success else "Failed to record"
+        })
+    except Exception as e:
+        logging.error(f"Error in record_action: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/api/collaborative/user/<user_id>', methods=['GET'])
+def recommend_for_user(user_id):
+    if not api_status["collaborative_model_loaded"]:
+        return jsonify({"status": "error", "message": "Collaborative model not loaded"}), 503
+    count = request.args.get('count', default=10, type=int)
+    recs = user_based_recommendations(user_id, count)
+    return jsonify({"status": "success", "recommendations": recs})
+
+
+@app.route('/api/collaborative/product/<int:product_id>', methods=['GET'])
+def recommend_for_product(product_id):
+    if not api_status["collaborative_model_loaded"]:
+        return jsonify({"status": "error", "message": "Collaborative model not loaded"}), 503
+    count = request.args.get('count', default=10, type=int)
+    recs = item_based_recommendations(product_id, count)
+    return jsonify({"status": "success", "recommendations": recs})
+
+
+@app.route('/api/hybrid', methods=['GET'])
+def hybrid():
+    user_id = request.args.get('user_id')
+    session_id = request.args.get('session_id')
+    product_id = request.args.get('product_id', type=int)
+    count = request.args.get('count', default=10, type=int)
+
+    if not (api_status["collaborative_model_loaded"] or api_status["model_loaded"]):
+        return jsonify({"status": "error", "message": "No model loaded"}), 503
+
+    user_identifier = user_id if user_id else f"session_{session_id}"
+    recs = hybrid_recommendations(user_identifier, product_id, count)
+    return jsonify({"status": "success", "recommendations": recs})
+
 
 if __name__ == '__main__':
     if load_data():
@@ -392,6 +471,24 @@ if __name__ == '__main__':
         logging.warning("Starting API server without data loaded. Status will be 'error' until reload.")
     app.run(host='0.0.0.0', port=5000, debug=False)
 
+def retrain_collaborative_model_periodically():
+    try:
+        conn = get_db_connection()
+        from collaborative_filtering import build_collaborative_model
+        build_collaborative_model(conn, force=True)
+        conn.close()
+        logging.info("Scheduled retraining of collaborative model completed.")
+    except Exception as e:
+        logging.error(f"Scheduled retraining failed: {str(e)}")
+
+# Bắt đầu scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(retrain_collaborative_model_periodically, 'interval', minutes=1)  # chạy mỗi 10 phút
+scheduler.start()
+
+
 # Load data khi khởi động ứng dụng
 with app.app_context():
     load_data()
+
+
