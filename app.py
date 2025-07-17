@@ -47,8 +47,10 @@ model_data_path = MODEL_DIR / 'model_data.pkl'
 
 # Cấu hình database
 DB_CONFIG = {
-    "host": "localhost",
-    "database": "AGRI_MARKET",
+    # "host": "localhost",
+    "host": "172.17.0.1",
+    # "database": "AGRI_MARKET",
+    "database": "agri_market",
     "user": "postgres",
     "password": "Hoanglam06112003@",
     "port": 5432

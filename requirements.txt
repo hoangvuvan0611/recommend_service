@@ -1,0 +1,6 @@
+Flask
+Flask-Cors
+pandas
+psycopg2-binary
+apscheduler
+scikit-learn
