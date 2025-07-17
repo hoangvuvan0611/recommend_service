@@ -51,7 +51,8 @@ DB_CONFIG = {
     "host": "172.17.0.1",
     # "database": "AGRI_MARKET",
     "database": "agri_market",
-    "user": "postgres",
+    # "user": "postgres",
+    "user": "vuvanhoang",
     "password": "Hoanglam06112003@",
     "port": 5432
 }
